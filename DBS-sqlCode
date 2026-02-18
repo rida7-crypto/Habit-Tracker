@@ -1,0 +1,278 @@
+create database HabitTracker;
+use HabitTracker;
+
+CREATE TABLE User (
+    user_id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) NOT NULL UNIQUE,
+    email VARCHAR(100) NOT NULL UNIQUE,
+    password VARCHAR(255) NOT NULL
+);
+
+CREATE TABLE Habit (
+    habit_id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    habit_name VARCHAR(100) NOT NULL,
+    start_date DATE NOT NULL,
+    streak INT DEFAULT 0,
+    FOREIGN KEY (user_id) REFERENCES User(user_id)
+);
+
+CREATE TABLE ProgressLog (
+    log_id INT AUTO_INCREMENT PRIMARY KEY,
+    habit_id INT NOT NULL,
+    log_date DATE NOT NULL,
+    FOREIGN KEY (habit_id) REFERENCES Habit(habit_id)
+);
+
+CREATE TABLE Challenge (
+    challenge_id INT AUTO_INCREMENT PRIMARY KEY,
+    habit_id INT NOT NULL,
+    user_id INT NOT NULL,
+    challenge_status ENUM('Ongoing', 'Completed') DEFAULT 'Ongoing',
+    FOREIGN KEY (habit_id) REFERENCES Habit(habit_id),
+    FOREIGN KEY (user_id) REFERENCES User(user_id)
+);
+
+DELIMITER $$
+
+CREATE TRIGGER update_streak_after_log
+AFTER INSERT ON ProgressLog
+FOR EACH ROW
+BEGIN
+    DECLARE streak_count INT;
+
+    SELECT COUNT(log_date)
+    INTO streak_count
+    FROM ProgressLog
+    WHERE habit_id = NEW.habit_id AND log_date >= DATE_SUB(CURDATE(), INTERVAL 1 DAY);
+
+    UPDATE Habit
+    SET streak = streak_count
+    WHERE habit_id = NEW.habit_id;
+END;
+$$
+
+DELIMITER ;
+
+DELIMITER $$
+
+CREATE PROCEDURE notify_user()
+BEGIN
+    DECLARE habitName VARCHAR(100);
+    DECLARE done INT DEFAULT 0;
+    DECLARE habitCursor CURSOR FOR 
+        SELECT habit_name FROM Habit WHERE streak = 0;
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+
+    OPEN habitCursor;
+
+    read_loop: LOOP
+        FETCH habitCursor INTO habitName;
+        IF done THEN
+            LEAVE read_loop;
+        END IF;
+        SELECT CONCAT('Reminder to log habit: ', habitName);
+    END LOOP;
+
+    CLOSE habitCursor;
+END;
+$$
+
+DELIMITER ;
+
+DELIMITER $$
+
+CREATE PROCEDURE complete_challenge(IN challengeID INT)
+BEGIN
+    DECLARE habitID INT;
+
+    START TRANSACTION;
+
+    SELECT habit_id INTO habitID FROM Challenge WHERE challenge_id = challengeID;
+
+    UPDATE Challenge SET challenge_status = 'Completed' WHERE challenge_id = challengeID;
+
+    UPDATE Habit SET streak = streak + 1 WHERE habit_id = habitID;
+
+    COMMIT;
+END;
+$$
+
+DELIMITER ;
+
+
+
+	
+SELECT username, habit_name, streak 
+FROM User
+JOIN Habit ON User.user_id = Habit.user_id
+ORDER BY streak DESC
+LIMIT 1;
+
+SELECT habit_name, COUNT(log_date) AS total_logs
+FROM ProgressLog
+JOIN Habit ON ProgressLog.habit_id = Habit.habit_id
+GROUP BY habit_name;
+
+SELECT 
+    U.username AS user_name,
+    COUNT(H.habit_id) AS total_habits,
+    SUM(H.streak) AS total_streaks
+FROM 
+    User U
+JOIN 
+    Habit H ON U.user_id = H.user_id
+GROUP BY 
+    U.user_id
+ORDER BY 
+    total_streaks DESC, total_habits DESC
+LIMIT 10;
+select * from user;
+select * from habit;
+select * from progresslog;
+select * from challenge;
+select * from habitnotifications;
+SELECT habit_name FROM Habit WHERE streak = 0;
+
+
+ALTER TABLE Habit
+DROP FOREIGN KEY habit_ibfk_1;
+
+ALTER TABLE Habit
+ADD CONSTRAINT habit_ibfk_1 FOREIGN KEY (user_id) REFERENCES User(user_id) ON DELETE CASCADE;
+
+ALTER TABLE ProgressLog
+DROP FOREIGN KEY progresslog_ibfk_1;
+
+ALTER TABLE ProgressLog
+ADD CONSTRAINT progresslog_ibfk_1 FOREIGN KEY (habit_id) REFERENCES Habit(habit_id) ON DELETE CASCADE;
+
+SELECT 
+    H.habit_id,
+    H.habit_name,
+    ROUND((COUNT(P.log_date) / DATEDIFF(CURDATE(), H.start_date)) * 100, 2) AS consistency_score
+FROM 
+    Habit H
+LEFT JOIN 
+    ProgressLog P ON H.habit_id = P.habit_id
+WHERE 
+    DATEDIFF(CURDATE(), H.start_date) > 0 -- Avoid division by zero
+GROUP BY 
+    H.habit_id, H.habit_name;
+    
+    
+
+ALTER TABLE Habit
+ADD COLUMN dependent_habit_id INT DEFAULT NULL;
+
+ALTER TABLE Habit
+ADD CONSTRAINT fk_dependent_habit FOREIGN KEY (dependent_habit_id) REFERENCES Habit(habit_id);
+
+ALTER TABLE Habit
+ADD COLUMN priority INT DEFAULT 3;
+
+SELECT 
+    H.habit_id,
+    H.habit_name,
+    H.priority,
+    ROUND((COUNT(P.log_date) / DATEDIFF(CURDATE(), H.start_date)) * 100, 2) AS consistency_score,
+    H.streak,
+    ROUND(((H.streak * 2) + (H.priority * 3) + (COUNT(P.log_date) / DATEDIFF(CURDATE(), H.start_date)) * 100) / 3, 2) AS habit_score
+FROM 
+    Habit H
+LEFT JOIN 
+    ProgressLog P ON H.habit_id = P.habit_id
+WHERE 
+    DATEDIFF(CURDATE(), H.start_date) > 0
+GROUP BY 
+    H.habit_id
+ORDER BY 
+    habit_score DESC
+LIMIT 0, 1000;
+    
+    
+    DELIMITER $$
+
+
+CREATE TABLE HabitNotifications (
+    notification_id INT AUTO_INCREMENT PRIMARY KEY,
+    habit_id INT NOT NULL,
+    dependent_habit_name VARCHAR(100),
+    notification_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+DELIMITER $$
+
+CREATE TRIGGER log_dependent_habit
+AFTER INSERT ON ProgressLog
+FOR EACH ROW
+BEGIN
+    DECLARE dependentName VARCHAR(100);
+
+    -- Fetch the name of the dependent habit
+    SELECT habit_name 
+    INTO dependentName
+    FROM Habit 
+    WHERE habit_id = (SELECT dependent_habit_id FROM Habit WHERE habit_id = NEW.habit_id);
+
+    -- Insert a reminder into the notifications table if a dependent habit exists
+    IF dependentName IS NOT NULL THEN
+        INSERT INTO HabitNotifications (habit_id, dependent_habit_name)
+        VALUES (NEW.habit_id, dependentName);
+    END IF;
+END;
+$$
+
+DELIMITER ;
+
+
+SELECT H.habit_id, H.habit_name, 
+       ROUND((COUNT(P.log_date) / DATEDIFF(CURDATE(), H.start_date)) * 100, 2) AS consistency_score
+FROM Habit H
+LEFT JOIN ProgressLog P ON H.habit_id = P.habit_id
+WHERE DATEDIFF(CURDATE(), H.start_date) > 0
+GROUP BY H.habit_id, H.habit_name;
+
+
+SELECT H.habit_id, H.habit_name, ROUND((COUNT(P.log_date) / DATEDIFF(CURDATE(), H.start_date)) * 100, 2) AS consistency_score
+FROM Habit H
+LEFT JOIN ProgressLog P ON H.habit_id = P.habit_id
+WHERE DATEDIFF(CURDATE(), H.start_date) > 0
+GROUP BY H.habit_id, H.habit_name;
+
+SELECT * 
+FROM Habit 
+WHERE start_date <= CURDATE() AND DATEDIFF(CURDATE(), start_date) > 0;
+
+SELECT * 
+FROM Habit AS H 
+WHERE H.start_date <= CURDATE() AND DATEDIFF(CURDATE(), H.start_date) > 0;
+
+SELECT * FROM Habit;
+SELECT * FROM ProgressLog;
+
+SELECT H.habit_id, H.habit_name,
+       ROUND((COUNT(P.log_date) / DATEDIFF(CURDATE(), H.start_date)) * 100, 2) AS consistency_score
+FROM Habit H
+LEFT JOIN ProgressLog P ON H.habit_id = P.habit_id
+WHERE H.start_date <= CURDATE() AND DATEDIFF(CURDATE(), H.start_date) > 0
+GROUP BY H.habit_id, H.habit_name;
+
+SELECT H.habit_id, 
+       H.habit_name, 
+       ROUND((COUNT(P.log_date) / DATEDIFF(CURDATE(), H.start_date)) * 100, 2) AS consistency_score
+FROM Habit H
+LEFT JOIN ProgressLog P ON H.habit_id = P.habit_id
+WHERE H.user_id = 1 -- Replace 1 with the desired user ID
+  AND H.start_date <= CURDATE()
+  AND DATEDIFF(CURDATE(), H.start_date) > 0
+GROUP BY H.habit_id, H.habit_name;
+
+UPDATE Habit
+SET start_date = DATE_SUB(CURDATE(), INTERVAL 5 DAY);
+UPDATE Habit
+SET start_date = DATE_SUB(CURDATE(), INTERVAL 5 DAY)
+WHERE habit_id IS NOT NULL; -- Use a valid key column condition
+
+SET SQL_SAFE_UPDATES = 0;
